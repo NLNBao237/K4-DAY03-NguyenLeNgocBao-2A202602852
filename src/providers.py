@@ -4,8 +4,10 @@ Hỗ trợ Native Tool Calling và chuyển đổi linh hoạt qua biến môi t
 """
 
 import os
+import re
 import sys
 import json
+import time
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 
@@ -66,6 +68,28 @@ class GeminiProvider(BaseLLMProvider):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.model_name = model or os.getenv("LLM_MODEL") or "gemini-2.5-flash"
 
+    MAX_RATE_LIMIT_RETRIES = 3
+
+    def _generate_with_retry(self, client, contents, config):
+        """
+        Gọi Gemini; nếu dính giới hạn theo PHÚT (429 PerMinute) thì chờ đúng retryDelay rồi gọi lại,
+        tránh việc âm thầm fallback về Mock giữa vòng lặp ReAct. Giới hạn theo NGÀY thì không chờ.
+        """
+        for attempt in range(self.MAX_RATE_LIMIT_RETRIES + 1):
+            try:
+                return client.models.generate_content(model=self.model_name, contents=contents, config=config)
+            except Exception as e:
+                message = str(e)
+                is_rate_limited = "429" in message or "RESOURCE_EXHAUSTED" in message
+                is_daily_quota = "PerDay" in message
+                if not is_rate_limited or is_daily_quota or attempt == self.MAX_RATE_LIMIT_RETRIES:
+                    raise
+                match = re.search(r"retry in ([\d.]+)s", message) or re.search(r"retryDelay'?:\s*'(\d+)s", message)
+                delay = float(match.group(1)) + 1 if match else 30.0
+                print(f"⏳ [Gemini Rate Limit]: Vượt giới hạn request/phút. Chờ {delay:.0f}s rồi thử lại "
+                      f"(lần {attempt + 1}/{self.MAX_RATE_LIMIT_RETRIES})...")
+                time.sleep(delay)
+
     def generate(self, prompt: str, system_prompt: str = "") -> str:
         if not self.api_key or self.api_key == "your_gemini_api_key_here":
             return "[Gemini Error]: Chưa cấu hình GEMINI_API_KEY trong file .env! Đang sử dụng chế độ Mock."
@@ -107,11 +131,7 @@ class GeminiProvider(BaseLLMProvider):
                 temperature=0.2
             )
 
-            response = client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=config
-            )
+            response = self._generate_with_retry(client, prompt, config)
 
             # Kiểm tra xem Gemini có trả về Tool Call không
             if response.function_calls:
